@@ -1,31 +1,138 @@
-# The Sparsely Gated Mixture of Experts Layer for PyTorch
+# Mixture of Experts (MoE) Implementation
 
+This repository contains an implementation of the Sparsely-Gated Mixture-of-Experts (MoE) layer as described in the paper ["Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer"](https://arxiv.org/abs/1701.06538) by Shazeer et al.
 
+## Features
 
-![source: https://techburst.io/outrageously-large-neural-network-gated-mixture-of-experts-billions-of-parameter-same-d3e901f2fe05](https://miro.medium.com/max/1000/1*AaBzgpJcySeO1UDvOQ_CnQ.png)
+- **Flat MoE**: The original Mixture of Experts implementation with a single gating network
+- **Hierarchical MoE**: Two-level gating network as described in the paper
+- **LSTM Integration**: LSTM layers with MoE layers in between, as used in the paper's language models
+- **Noisy Top-K Gating**: Implementation of the noisy gating mechanism for load balancing
 
+## Requirements
 
-This repository contains the PyTorch re-implementation of the sparsely-gated MoE layer described in the paper [Outrageously Large Neural Networks](https://arxiv.org/abs/1701.06538) for PyTorch. 
-```python
+```
+torch>=1.7.0
+torchvision>=0.8.0
+numpy>=1.19.0
+```
 
-from moe import MoE
-import torch
+## Usage
 
-# instantiate the MoE layer
-model = MoE(input_size=1000, output_size=20, num_experts=10,hidden_size=66, k= 4, noisy_gating=True)
+### Basic Usage
 
-X = torch.rand(32, 1000)
+The repository includes examples to demonstrate the usage of the MoE implementation:
 
-#train
-model.train()
-# forward
-y_hat, aux_loss = model(X)
+#### CIFAR10 Example
 
-# evaluation
+```bash
+# Run with flat MoE (original implementation)
+python cifar10_example.py
 
-model.eval()
-y_hat, aux_loss = model(X)
+# Run with hierarchical MoE
+python cifar10_example.py --hierarchical --num_groups 5 --experts_per_group 2
 
+# Run with LSTM + MoE
+python cifar10_example.py --lstm --num_layers 2
+
+# Run with LSTM + hierarchical MoE
+python cifar10_example.py --lstm --hierarchical --num_groups 5 --experts_per_group 2 --num_layers 2
+```
+
+#### Language Model Example
+
+```bash
+# Run with flat MoE
+python language_model_example.py
+
+# Run with hierarchical MoE
+python language_model_example.py --hierarchical --num_groups 4 --experts_per_group 2
+
+# Run with bidirectional LSTM
+python language_model_example.py --bidirectional
+
+# Run with more LSTM layers
+python language_model_example.py --num_layers 3
+```
+
+### Command Line Arguments
+
+#### CIFAR10 Example
+
+- `--hierarchical`: Use hierarchical MoE instead of flat MoE
+- `--lstm`: Use LSTM with MoE layers
+- `--num_experts`: Number of experts (default: 10)
+- `--hidden_size`: Hidden size of experts (default: 128)
+- `--num_groups`: Number of groups for hierarchical MoE (default: 5)
+- `--experts_per_group`: Number of experts per group for hierarchical MoE (default: 2)
+- `--num_layers`: Number of LSTM layers (default: 2)
+- `--bidirectional`: Use bidirectional LSTM
+- `--epochs`: Number of training epochs (default: 10)
+- `--batch_size`: Batch size (default: 64)
+- `--lr`: Learning rate (default: 0.001)
+
+#### Language Model Example
+
+- `--hierarchical`: Use hierarchical MoE instead of flat MoE
+- `--num_experts`: Number of experts (default: 8)
+- `--hidden_size`: Hidden size of LSTM and experts (default: 128)
+- `--num_groups`: Number of groups for hierarchical MoE (default: 4)
+- `--experts_per_group`: Number of experts per group for hierarchical MoE (default: 2)
+- `--num_layers`: Number of LSTM layers (default: 2)
+- `--bidirectional`: Use bidirectional LSTM
+- `--epochs`: Number of training epochs (default: 10)
+- `--batch_size`: Batch size (default: 32)
+- `--lr`: Learning rate (default: 0.001)
+- `--seq_length`: Sequence length for language modeling (default: 50)
+
+## Implementation Details
+
+### Flat MoE
+
+The flat MoE implementation uses a single gating network to select which experts to use for each input. The gating network outputs a sparse vector of weights, and only the top-k experts are used for each input.
+
+### Hierarchical MoE
+
+The hierarchical MoE implementation uses a two-level gating network:
+1. The primary gating network selects which groups of experts to use
+2. The secondary gating networks (one per group) select which experts within each selected group to use
+
+This allows for more efficient routing of inputs to experts, especially when the number of experts is large.
+
+### LSTM with MoE
+
+The LSTM with MoE implementation places MoE layers between stacked LSTM layers, as described in the paper. This allows the model to use different experts for different types of inputs, while still maintaining the sequential processing capabilities of LSTMs.
+
+## Paper Implementation Notes
+
+This implementation follows the architecture described in the paper:
+
+1. For language models, the paper uses stacked LSTM layers with MoE layers in between
+2. The MoE layer is applied to the output of each LSTM layer (except the last)
+3. The hierarchical MoE is used when the number of experts is large (thousands)
+4. The paper uses noisy top-k gating to encourage load balancing among experts
+
+## Examples
+
+### CIFAR10 Example
+
+The CIFAR10 example demonstrates how to use the MoE layer for image classification. It can be configured to use either a flat MoE, a hierarchical MoE, or an LSTM with MoE layers.
+
+### Language Model Example
+
+The language model example demonstrates how to use the LSTM with MoE layers for character-level language modeling. It includes a simple character-level dataset and text generation capabilities.
+
+## Citation
+
+If you use this code, please cite the original paper:
+
+```
+@article{shazeer2017outrageously,
+  title={Outrageously large neural networks: The sparsely-gated mixture-of-experts layer},
+  author={Shazeer, Noam and Mirhoseini, Azalia and Maziarz, Krzysztof and Davis, Andy and Le, Quoc and Hinton, Geoffrey and Dean, Jeff},
+  journal={arXiv preprint arXiv:1701.06538},
+  year={2017}
+}
 ```
 
 
@@ -38,36 +145,3 @@ y_hat, aux_loss = model(X)
 To install the requirements run:
 
 ```pip install -r requirements.py```
-
-
-# Example
-
-The file ```example.py``` contains a minimal working example illustrating how to train and evaluate the MoE layer with dummy inputs and targets. To run the example:
-
-```python example.py```
-
-# CIFAR 10 example
-
-The file ```cifar10_example.py``` contains a minimal working example of the CIFAR 10 dataset. It achieves an accuracy of 39% with arbitrary hyper-parameters and not fully converged. To run the example:
-
-```python cifar10_example.py```
-
-# Used by
-
-[FastMoE: A Fast Mixture-of-Expert Training System](https://arxiv.org/pdf/2103.13262.pdf) This implementation was used as a reference PyTorch implementation for single-GPU training. 
-
-# Acknowledgements
-
-The code is based on the TensorFlow implementation that can be found [here](https://github.com/tensorflow/tensor2tensor/blob/master/tensor2tensor/utils/expert_utils.py).
-
-
-# Citing
-```
-@misc{rau2019moe,
-    title={Sparsely-gated Mixture-of-Experts PyTorch implementation},
-    author={Rau, David},
-    journal={https://github.com/davidmrau/mixture-of-experts},
-    year={2019}
-}
-```
-
