@@ -12,7 +12,17 @@ import torch
 import torch.nn as nn
 from torch.distributions.normal import Normal
 import numpy as np
+import logging
+import matplotlib.pyplot as plt
+from collections import defaultdict
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Global counters for expert usage
+expert_usage_counts = defaultdict(int)
+expert_batch_counts = defaultdict(list)
 
 class SparseDispatcher(object):
     """Helper for implementing a mixture of experts.
@@ -139,10 +149,11 @@ class MoE(nn.Module):
     k: an integer - how many experts to use for each batch element
     hierarchical: a boolean - whether to use hierarchical MoE
     num_groups: an integer - number of expert groups for hierarchical MoE
+    loss_coef: a scalar - multiplier on load-balancing losses
     """
 
     def __init__(self, input_size, output_size, num_experts, hidden_size, noisy_gating=True, k=4, 
-                 hierarchical=False, num_groups=None, experts_per_group=None):
+                 hierarchical=False, num_groups=None, experts_per_group=None, loss_coef=1e-2):
         super(MoE, self).__init__()
         self.noisy_gating = noisy_gating
         self.num_experts = num_experts
@@ -151,6 +162,12 @@ class MoE(nn.Module):
         self.hidden_size = hidden_size
         self.k = k
         self.hierarchical = hierarchical
+        
+        # Initialize expert usage counters
+        self.expert_usage_counts = torch.zeros(num_experts)
+        self.total_samples_processed = 0
+        self.batch_count = 0
+        self.loss_coef = loss_coef
         
         # Setup for hierarchical MoE
         if hierarchical:
@@ -162,6 +179,12 @@ class MoE(nn.Module):
             self.experts_per_group = experts_per_group
             self.k_groups = min(2, num_groups)  # Number of groups to select
             self.k_experts_per_group = min(2, experts_per_group)  # Number of experts to select within each group
+            
+            # Initialize group usage counters
+            self.group_usage_counts = torch.zeros(num_groups)
+            
+            logger.info(f"Initialized Hierarchical MoE with {num_groups} groups and {experts_per_group} experts per group")
+            logger.info(f"Total experts: {num_experts}, k_groups: {self.k_groups}, k_experts_per_group: {self.k_experts_per_group}")
             
             # Primary gating network (selects groups)
             self.w_gate_primary = nn.Parameter(torch.zeros(input_size, num_groups), requires_grad=True)
@@ -188,6 +211,8 @@ class MoE(nn.Module):
         else:
             # Flat MoE (original implementation)
             # instantiate experts
+            logger.info(f"Initialized Flat MoE with {num_experts} experts, k={k}")
+            
             self.experts = nn.ModuleList([
                 MLP(self.input_size, self.output_size, self.hidden_size) 
                 for _ in range(self.num_experts)
@@ -337,6 +362,18 @@ class MoE(nn.Module):
         # Get the indices of the selected groups for each batch element
         _, primary_indices = primary_gates.topk(self.k_groups, dim=1)
         
+        # Update group usage counts
+        for group_idx in range(self.num_groups):
+            group_count = (primary_indices == group_idx).sum().item()
+            self.group_usage_counts[group_idx] += group_count
+        
+        # Log group selection details (every 100 batches)
+        if self.batch_count % 100 == 0:
+            selected_groups_count = torch.bincount(primary_indices.flatten(), minlength=self.num_groups)
+            logger.info(f"Group selection in batch {self.batch_count}:")
+            for g in range(self.num_groups):
+                logger.info(f"  Group {g}: selected {selected_groups_count[g].item()} times")
+        
         # Initialize the final gates tensor - without requires_grad=True
         final_gates = torch.zeros(batch_size, self.num_experts, device=x.device)
         
@@ -374,10 +411,9 @@ class MoE(nn.Module):
         
         return final_gates, load
 
-    def forward(self, x, loss_coef=1e-2):
+    def forward(self, x):
         """Args:
         x: tensor shape [batch_size, input_size]
-        loss_coef: a scalar - multiplier on load-balancing losses
 
         Returns:
         y: a tensor with shape [batch_size, output_size].
@@ -385,18 +421,32 @@ class MoE(nn.Module):
         training loss of the model.  The backpropagation of this loss
         encourages all experts to be approximately equally used across a batch.
         """
+        batch_size = x.size(0)
+        self.total_samples_processed += batch_size
+        self.batch_count += 1
+        
         if self.hierarchical:
             gates, load = self.hierarchical_gating(x, self.training)
             
             # Calculate importance loss
             importance = gates.sum(0)
             loss = self.cv_squared(importance) + self.cv_squared(load)
-            loss *= loss_coef
+            loss *= self.loss_coef
             
             # Dispatch to experts
             dispatcher = SparseDispatcher(self.num_experts, gates)
             expert_inputs = dispatcher.dispatch(x)
             gates = dispatcher.expert_to_gates()
+            
+            # Update expert usage counts
+            for i in range(self.num_experts):
+                # Count how many samples were routed to this expert
+                samples_to_expert = expert_inputs[i].size(0)
+                self.expert_usage_counts[i] += samples_to_expert
+                
+                # For global tracking
+                expert_usage_counts[f"{id(self)}_{i}"] += samples_to_expert
+                expert_batch_counts[f"{id(self)}_{i}"].append(samples_to_expert)
             
             # Process inputs through experts
             expert_outputs = []
@@ -414,6 +464,11 @@ class MoE(nn.Module):
                     expert_outputs.append(torch.zeros((0, self.output_size), device=x.device))
             
             y = dispatcher.combine(expert_outputs)
+            
+            # Log expert usage statistics (every 100 batches)
+            if self.batch_count % 100 == 0:
+                self.log_expert_usage()
+                
         else:
             # Original flat MoE implementation
             gates, load = self.noisy_top_k_gating(x, self.training)
@@ -421,15 +476,96 @@ class MoE(nn.Module):
             # Calculate importance loss
             importance = gates.sum(0)
             loss = self.cv_squared(importance) + self.cv_squared(load)
-            loss *= loss_coef
+            loss *= self.loss_coef
             
             dispatcher = SparseDispatcher(self.num_experts, gates)
             expert_inputs = dispatcher.dispatch(x)
             gates = dispatcher.expert_to_gates()
+            
+            # Update expert usage counts
+            for i in range(self.num_experts):
+                # Count how many samples were routed to this expert
+                samples_to_expert = expert_inputs[i].size(0)
+                self.expert_usage_counts[i] += samples_to_expert
+                
+                # For global tracking
+                expert_usage_counts[f"{id(self)}_{i}"] += samples_to_expert
+                expert_batch_counts[f"{id(self)}_{i}"].append(samples_to_expert)
+            
             expert_outputs = [self.experts[i](expert_inputs[i]) for i in range(self.num_experts)]
             y = dispatcher.combine(expert_outputs)
             
+            # Log expert usage statistics (every 100 batches)
+            if self.batch_count % 100 == 0:
+                self.log_expert_usage()
         return y, loss
+    
+    def log_expert_usage(self):
+        """Log expert usage statistics"""
+        if self.total_samples_processed == 0:
+            return
+            
+        # Calculate percentage of samples processed by each expert
+        expert_percentages = (self.expert_usage_counts / self.total_samples_processed) * 100
+        
+        logger.info(f"Expert usage after {self.batch_count} batches ({self.total_samples_processed} samples):")
+        
+        if self.hierarchical:
+            # Log hierarchical structure details
+            for g in range(self.num_groups):
+                group_percentage = (self.group_usage_counts[g] / self.total_samples_processed) * 100
+                logger.info(f"  Group {g}: {group_percentage:.2f}% of samples")
+                
+                # Log experts within this group
+                for e in range(self.experts_per_group):
+                    global_expert_idx = g * self.experts_per_group + e
+                    logger.info(f"    Expert {global_expert_idx} (G{g}-E{e}): {expert_percentages[global_expert_idx]:.2f}% of samples")
+        else:
+            # Log flat structure details
+            for i in range(self.num_experts):
+                logger.info(f"  Expert {i}: {expert_percentages[i]:.2f}% of samples")
+        
+        # Calculate load balance metrics
+        cv = self.cv_squared(self.expert_usage_counts + 1e-10)
+        logger.info(f"  Load balance CV^2: {cv.item():.4f} (lower is better)")
+        
+        # Calculate the Gini coefficient as another measure of load balance
+        sorted_counts = torch.sort(self.expert_usage_counts)[0]
+        n = len(sorted_counts)
+        if n > 0 and torch.sum(sorted_counts) > 0:
+            cumsum = torch.cumsum(sorted_counts, 0)
+            gini = (n + 1 - 2 * torch.sum(cumsum) / torch.sum(sorted_counts)) / n
+            logger.info(f"  Load balance Gini coefficient: {gini.item():.4f} (lower is better)")
+    
+    def plot_expert_usage(self, title="Expert Usage Distribution"):
+        """Plot expert usage distribution"""
+        try:
+            plt.figure(figsize=(10, 6))
+            
+            # Convert to numpy for plotting
+            expert_usage = self.expert_usage_counts.cpu().numpy()
+            
+            # Create x-axis labels
+            if self.hierarchical:
+                labels = [f"G{i//self.experts_per_group}-E{i%self.experts_per_group}" for i in range(self.num_experts)]
+            else:
+                labels = [f"Expert {i}" for i in range(self.num_experts)]
+            
+            # Plot bar chart
+            plt.bar(range(len(expert_usage)), expert_usage)
+            plt.xticks(range(len(expert_usage)), labels, rotation=45)
+            plt.xlabel("Expert")
+            plt.ylabel("Number of samples processed")
+            plt.title(title)
+            plt.tight_layout()
+            
+            # Save the plot
+            plt.savefig(f"expert_usage_{id(self)}.png")
+            logger.info(f"Expert usage plot saved to expert_usage_{id(self)}.png")
+            
+            plt.close()
+        except Exception as e:
+            logger.error(f"Error plotting expert usage: {e}")
 
 
 class LSTMWithMoE(nn.Module):
@@ -450,19 +586,20 @@ class LSTMWithMoE(nn.Module):
         experts_per_group: Number of experts per group for hierarchical MoE
         dropout: Dropout probability (0 means no dropout)
         bidirectional: If True, becomes a bidirectional LSTM
+        loss_coef: Coefficient for the load balancing loss
     """
     def __init__(self, input_size, hidden_size, num_layers=1, 
                  moe_input_size=None, moe_output_size=None, num_experts=8, 
                  moe_hidden_size=128, noisy_gating=True, k=4,
                  hierarchical=False, num_groups=None, experts_per_group=None,
-                 dropout=0, bidirectional=False):
+                 dropout=0, bidirectional=False, loss_coef=1e-2):
         super(LSTMWithMoE, self).__init__()
         
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.bidirectional = bidirectional
-        
+        self.loss_coef = loss_coef
         # Default MoE input/output sizes if not specified
         if moe_input_size is None:
             moe_input_size = hidden_size * (2 if bidirectional else 1)
@@ -496,7 +633,8 @@ class LSTMWithMoE(nn.Module):
                 k=k,
                 hierarchical=hierarchical,
                 num_groups=num_groups,
-                experts_per_group=experts_per_group
+                experts_per_group=experts_per_group,
+                loss_coef=loss_coef
             )
             self.moe_layers.append(moe)
             
@@ -573,11 +711,12 @@ class MoEModel(nn.Module):
         hierarchical: Whether to use hierarchical MoE
         num_groups: Number of expert groups for hierarchical MoE
         experts_per_group: Number of experts per group for hierarchical MoE
+        loss_coef: Coefficient for the load balancing loss
     """
     def __init__(self, input_size, hidden_size, output_size, num_layers=2, 
                  num_experts=8, moe_hidden_size=128, lstm_dropout=0.1, 
                  bidirectional=False, hierarchical=False, num_groups=None, 
-                 experts_per_group=None):
+                 experts_per_group=None, loss_coef=1e-2):
         super(MoEModel, self).__init__()
         
         # LSTM with MoE layers
@@ -593,7 +732,8 @@ class MoEModel(nn.Module):
             num_groups=num_groups,
             experts_per_group=experts_per_group,
             dropout=lstm_dropout,
-            bidirectional=bidirectional
+            bidirectional=bidirectional,
+            loss_coef=loss_coef
         )
         
         # Output layer
